@@ -1,7 +1,10 @@
 import numpy as np
 import pandas as pd
-import networkx as nx
 from scipy.sparse.csgraph import minimum_spanning_tree
+from scipy.cluster.hierarchy import linkage
+from scipy.spatial.distance import squareform
+from scipy.cluster.hierarchy import cophenet
+
 
 def correlation_to_distance(corr_matrix):
     """
@@ -39,39 +42,79 @@ def compute_mst(distance_df):
 
     return mst_dense
 
-def extract_ultrametric(mst_matrix, labels):
+def extract_ultrametric(linkage_matrix, labels):
     """
-    walks the MST to get the subdominant ultrametricc distance between all nodes.
-    The ultrametric distance is the max edge weight on the path between two nodes
-    """
-    # turn our matrix into a network graph
-    G = nx.from_numpy_array(mst_matrix)
-    num_nodes = len(G.nodes)
-
-    # create blank grid to hold new distances
-    ultrametric_grid = np.zeros((num_nodes, num_nodes))
-
-    # check every possible pair of stocks i and j
-    for i in range(num_nodes):
-        for j in range(i+1, num_nodes):
-
-            #find unique path between i and j in the tree
-            path = nx.shortest_path(G, source = i, target = j)
-
-            # find edge with max weight on this path
-            max_weight = 0
-            for k in range(len(path) -1):
-                node_a = path[k]
-                node_b = path[k+1]
-                edge_weight = G[node_a][node_b]['weight']
-
-                if edge_weight > max_weight:
-                    max_weight = edge_weight
-
-            #save max weight to out grid
-            ultrametric_grid[i,j] = max_weight
-            ultrametric_grid[j,i] = max_weight
-
-    return pd.DataFrame(ultrametric_grid, index=labels, columns=labels)
-
+    Computes the subdominant ultrametric distance between all nodes.
+    By definition, this is the cophenetic distance of the single-linkage dendrogram.
     
+    Arguments: linkage_matrix (ndarray): The (N-1) x 4 linkage matrix from execute_slc.
+               labels (list/Index): The asset tickers/labels.
+        
+    Returns:
+        pd.DataFrame: A symmetric DataFrame containing the ultrametric distances.
+    """
+    # cophenet() calculates the exact max-path distance in the tree
+    # It returns a 1D array
+    condensed_ultra = cophenet(linkage_matrix)
+    
+    # Convert back to a square N x N matrix
+    ultra_matrix = squareform(condensed_ultra)
+    
+    return pd.DataFrame(ultra_matrix, index=labels, columns=labels)
+
+def calculate_scaling_exponent(linkage_matrix, p=2):
+    """
+    Calculates the p-adic scaling exponent alpha_hat from linkage matrix
+
+    returns alpha_hat and r_squared (goodness of fit)
+    """
+
+    #1. extract merge hieghts
+    h = linkage_matrix[:, 2][::-1]
+    h_1 = h[0]
+    n_merges = len(h)
+
+    #2. compute log height sequence lambda_ell = -log(h_ell / h_1)
+    lambdas = - np.log(np.clip(h[1:] / h_1, 1e-10, 1.0))
+
+    #3.define independent variable (depth of tree) x=(ell -1)
+    x = np.arange(1, n_merges)
+
+    #4. OLS regression through origin to find slope alpha_hat
+    beta = np.sum(x * lambdas) / np.sum(x**2)
+    alpha_hat = beta / np.log(p)
+
+    #5. calculate R^2 for goodness of fit
+    residuals = lambdas - (beta * x)
+    ss_res = np.sum(residuals**2)
+    ss_tot = np.sum((lambdas - np.mean(lambdas))**2)
+    r_squared = 1 - (ss_res / ss_tot) if ss_tot !=0 else 0
+
+    return alpha_hat, r_squared
+    
+
+def execute_slc(distance_matrix):
+
+    """
+    Executes Single Linkage Clustering (equivalent to MST) and returns the linkage matrix for further analysis
+    
+    Arguments: distance_matrix (array): mategna distance matrix
+
+    returns: linkage_matrix (array): hierarchical linkage matrix used for p-adic embeddings and alpha calculations.
+
+    """
+
+    # SciPy's linkage algorithm requires a 1D "condensed" distance array.
+    # If your correlation_to_distance function outputs a standard 2D square matrix,
+    # we need to condense it first to avoid SciPy throwing a dimensionality error.
+    if len(distance_matrix.shape) == 2:
+        # np.clip ensures no floating point errors push distances below 0
+        dist_clipped = np.clip(distance_matrix, 0, None)
+        condensed_dist = squareform(dist_clipped, checks=False)
+    else:
+        condensed_dist = distance_matrix
+        
+    # method='single' gives equivalence to the MST
+    linkage_mat = linkage(condensed_dist, method='single')
+    
+    return linkage_mat
